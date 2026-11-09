@@ -50,7 +50,7 @@ All pass ordering, iteration order, and register-colouring tie breaks are determ
 
 ## The machine.
 
-Every run reads the machine file supplied on the command line. Constant multiplication is changed only when the replacement latency is no greater than `lat_mul`. `mac` fusion is used only when `fused_mac = 1` and `lat_mac <= lat_mul + lat_alu`. `addsh` fusion is used only when `fused_addsh = 1` and `lat_addsh <= 2 * lat_alu`. Induction-variable division/remainder strength reduction is used only when `lat_alu <= lat_div`. The optimizer does not emit either fused instruction when its feature flag is zero. Register compaction reduces the number of distinct virtual names; KIR's simulator applies the machine's hardware-register and spill model to the resulting names.
+Every run reads the machine file supplied on the command line. Constant multiplication is changed only when the replacement latency is no greater than `lat_mul`. Adjacent `mul`/`add` fusion into `mac` is used only when `fused_mac = 1` and `lat_mac <= lat_mul + lat_alu`; the separate loop-MAC decomposition is considered only when `lat_mul + lat_alu <= lat_mac`. `addsh` fusion is used only when `fused_addsh = 1` and `lat_addsh <= 2 * lat_alu`. Induction-variable division/remainder strength reduction is used only when `lat_alu <= lat_div`. The optimizer does not emit either fused instruction when its feature flag is zero. Register compaction reduces the number of distinct virtual names; KIR's simulator applies the machine's hardware-register and spill model to the resulting names.
 
 ## Keeping the behaviour.
 

@@ -222,6 +222,36 @@ entry:
         if '\n  addsh ' not in fast_addsh_output.read_text(encoding='utf-8'):
             raise RuntimeError('profitable addsh fusion was not performed')
 
+        # LICM may replace a repeated MAC with one preheader multiply plus
+        # per-iteration adds only when the complete multiply+add chain is no
+        # slower than the MAC. A cheap ALU alone is not sufficient evidence.
+        slow_mul_mac = directory / 'slow_mul_mac.cfg'
+        write_machine(default, slow_mul_mac, lat_alu=1, lat_mul=100, lat_mac=2, fused_mac=1)
+        slow_mul_source = directory / 'slow_mul_mac_loop.kir'
+        slow_mul_source.write_text('''func slow_mul_mac_loop(v0)
+pre:
+  const v1, 0
+  const v2, 0
+  const v3, 4
+  jmp head
+head:
+  lt v4, v2, v3
+  br v4, body, done
+body:
+  add v6, v0, 5
+  store 0, v6
+  mac v1, v0, v0, v1
+  add v2, v2, 1
+  jmp head
+done:
+  ret v1
+''', encoding='utf-8')
+        slow_mul_output = validate(root, kit, slow_mul_mac, slow_mul_source,
+                                   'slow-loop-multiply-cost-model', random=100)
+        if '\n  mac ' not in slow_mul_output.read_text(encoding='utf-8'):
+            raise RuntimeError('LICM decomposed a MAC despite the slower multiply+add chain')
+        print('PASS machine cost: slow loop MAC decomposition rejected', flush=True)
+
         # Distinct dead definitions exercise cache invalidation without a
         # large live set; the former full-dictionary scans were quadratic.
         count = max(1, args.unique_definitions)

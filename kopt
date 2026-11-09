@@ -425,7 +425,7 @@ def simple_licm(blocks, mc=None):
     used = {x for block in blocks for ins in block.ins
             for x in ([dest(ins)] if dest(ins) else []) + uses(ins)}
     next_id = max([int(x[1:]) for x in used] + [-1]) + 1
-    latency_profitable_mac = (mc or {}).get('lat_alu', 1) < (mc or {}).get('lat_mac', 1)
+    latency_profitable_mac = (mc or {}).get('lat_mul', 1) + (mc or {}).get('lat_alu', 1) <= (mc or {}).get('lat_mac', 1)
 
     for head in blocks:
         term = head.ins[-1]

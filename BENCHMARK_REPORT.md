@@ -1,58 +1,59 @@
-# Benchmark report
+# Benchmark report — current source package
 
-This report was produced with the supplied official simulator and validator on
-all 100 practice programs and all five supplied machine configurations. Every
-matrix case used `kvalidate --against` with its default 100 randomized inputs
-plus the sample input.
+The following checks were run against the official Oxygen Debt starter kit.
+The kit's `bench/`, `examples/`, and `machines/` directories are not copied
+into this package.
 
-| Measure | Result |
+## Completed checks
+
+| Check | Result |
 |---|---:|
-| Program/machine combinations | 500 |
-| Equivalence/timing passes | 500 |
-| Failures or timeouts | 0 |
-| Original total cycles | 580,799 |
-| Optimized total cycles | 163,112 |
-| Total cycle reduction | 71.92% |
-| Geometric-mean speedup | 2.531x |
-| Full-matrix wall time | 1,104.8 seconds |
+| Official-validator semantic regression cases | 12/12 passed |
+| Explicit machine-cost assertions | 3/3 passed |
+| Independent-definition scalability case | 30,000 definitions in 1.031 s |
+| 100,000-instruction stress program | 4.133 s (30 s limit) |
+| 1,000 simultaneously-live-register stress program | 1.339 s (5 s limit) |
+| `sum_sq` equivalence on default machine | 101 inputs passed |
+| `sum_sq` optimized cycles on default machine | 21 |
+| Repeated optimizer invocation | Byte-identical output |
+| Fresh Git checkout: `./build.sh` and `./kopt` | Passed |
 
-The repaired revision enforced a five-second optimizer timeout per normal
-program; the slowest optimizer invocation was 1.25 seconds.
+The semantic regressions cover multiple definitions in loops, loop
+use-before-definition, entry-zero values versus parameters, self-updating
+arithmetic/CSE, self-addressing loads, live and dead MAC temporaries, and
+machine-dependent fusion/decomposition. The additional slow-multiply loop test
+prevents loop MAC decomposition when `lat_mul + lat_alu > lat_mac`.
 
-The matrix used the repaired, stable optimizer revision, with a five-second
-optimizer timeout enforced separately for every normal program. The
-bounded-square-sum
-closed-form output was additionally validated on all five machines with 1,001
-inputs each.
+The `sum_sq` optimized output contains eight instructions and takes 21 cycles
+on `machine_default.cfg`, compared with 2,690 cycles for the supplied original
+program. The official validator reported 101 checked inputs for this run.
 
-## `sum_sq` final comparison
+The skewed-machine regression that exposed the loop-MAC cost-model bug was also
+rechecked after the fix: the optimized output retained the MAC and took 67
+cycles; the buggy revision had decomposed it and took 163 cycles. Both versions
+were semantically equivalent, so this was a performance-only defect.
 
-| Machine | Original | Supplied reference (public machine) | Final optimizer |
-|---|---:|---:|---:|
-| `machine_default.cfg` | 2690 | 207 | 21 |
-| `machine_few_registers.cfg` | 4544 | — | 21 |
-| `machine_no_fused.cfg` | 2690 | — | 29 |
-| `machine_slow_memory.cfg` | 2696 | — | 25 |
-| `machine_wide_fast.cfg` | 690 | — | 19 |
+## Incomplete checks (not counted as passes)
 
-All five final outputs passed official equivalence validation on 1,001 inputs.
-The public-machine result is 9.86× faster than the supplied 207-cycle loop
-reference and 128.1× faster than the original sample run.
+- The extended `tests/adversarial.py` run did not complete within a 300-second
+  wall-clock cap. Its partial output is not counted as a pass.
+- A multi-machine practice-program benchmark sample did not complete within
+  the available wall-clock cap. No full 100-program x 5-machine equivalence or
+  cycle claim is made for this package.
+- The 500-combination figures in the superseded report belonged to a different
+  source revision and are intentionally not claimed here.
 
-## Largest base-matrix improvements
+## Reproduction
 
-| Machine | Program | Before | After | Saved |
-|---|---|---:|---:|---:|
-| `machine_few_registers.cfg` | `collatz` | 15245 | 1229 | 14016 |
-| `machine_few_registers.cfg` | `matmul4` | 14121 | 3595 | 10526 |
-| `machine_few_registers.cfg` | `nested_invariant` | 11614 | 1146 | 10468 |
-| `machine_few_registers.cfg` | `sieve` | 12906 | 2642 | 10264 |
-| `machine_few_registers.cfg` | `strength_ladder` | 10240 | 487 | 9753 |
-| `machine_default.cfg` | `matmul4` | 8196 | 1018 | 7178 |
+With an unpacked official kit at `KIT`, run:
 
-There were no performance regressions in the complete 500-row base matrix.
+```sh
+./build.sh
+python3 tests/regressions.py --kit KIT
+python3 tests/stress.py --machine KIT/machines/machine_default.cfg
+python3 tests/adversarial.py --kit KIT
+python3 tests/benchmark.py --kit KIT --out benchmark-full --random 100
+```
 
-## Runtime check
-
-The supplied 100,000-instruction stress program optimized in 7.703 seconds,
-within the 30-second large-program limit.
+The last command runs the full 100-program x 5-machine matrix. Its output is
+not included because a complete matrix did not finish in this environment.

@@ -42,8 +42,8 @@ Run the focused semantic, target-cost, and large-block checks with the official 
 
 ```sh
 python3 tests/regressions.py --kit KIT
-python3 tests/adversarial.py --kit KIT --random 100
+python3 tests/adversarial.py --kit KIT
 python3 tests/stress.py --machine KIT/machines/machine_default.cfg
 ```
 
-The regression script includes non-SSA loop-definition cases, entry-live initial register values, MAC temporary liveness, deliberately slow fused instructions, and a large number of independent definitions. The adversarial suite is an additional, slower check; its `--random` option controls its randomized validator inputs.
+The regression script includes non-SSA loop-definition cases, entry-live initial register values, MAC temporary liveness, deliberately slow fused instructions, and a large number of independent definitions. The adversarial suite is an additional, slower check with fixed per-case randomized validation counts.
