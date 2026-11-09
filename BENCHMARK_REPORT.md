@@ -1,4 +1,4 @@
-# Benchmark report — final candidate
+# Benchmark report : final candidate
 
 The official 100-program × 5-machine matrix was run against the final
 candidate on 2026-11-09 using `tests/benchmark.py --random 100`.
