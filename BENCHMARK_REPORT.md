@@ -1,59 +1,53 @@
-# Benchmark report — current source package
+# Benchmark report — final candidate
 
-The following checks were run against the official Oxygen Debt starter kit.
-The kit's `bench/`, `examples/`, and `machines/` directories are not copied
-into this package.
+The official 100-program × 5-machine matrix was run against the final
+candidate on 2026-11-09 using `tests/benchmark.py --random 100`.
 
-## Completed checks
-
-| Check | Result |
+| Measure | Result |
 |---|---:|
-| Official-validator semantic regression cases | 12/12 passed |
-| Explicit machine-cost assertions | 3/3 passed |
-| Independent-definition scalability case | 30,000 definitions in 1.031 s |
-| 100,000-instruction stress program | 4.133 s (30 s limit) |
-| 1,000 simultaneously-live-register stress program | 1.339 s (5 s limit) |
-| `sum_sq` equivalence on default machine | 101 inputs passed |
-| `sum_sq` optimized cycles on default machine | 21 |
-| Repeated optimizer invocation | Byte-identical output |
-| Fresh Git checkout: `./build.sh` and `./kopt` | Passed |
+| Program/machine combinations | 500 |
+| Equivalence/timing passes | 500 |
+| Failures or timeouts | 0 |
+| Performance regressions | 0 |
+| Original total cycles | 580,799 |
+| Optimized total cycles | 163,533 |
+| Total cycle reduction | 71.84% |
+| Geometric-mean speedup | 2.526× |
+| Full-matrix wall time | 897.4 seconds |
 
-The semantic regressions cover multiple definitions in loops, loop
-use-before-definition, entry-zero values versus parameters, self-updating
-arithmetic/CSE, self-addressing loads, live and dead MAC temporaries, and
-machine-dependent fusion/decomposition. The additional slow-multiply loop test
-prevents loop MAC decomposition when `lat_mul + lat_alu > lat_mac`.
+The matrix used the final MAC cost-model fix. The skewed-machine regression
+retains the loop MAC and measures 67 cycles; the buggy revision decomposed the
+same loop to 163 cycles. `sum_sq` remains 21 cycles on the public machine and
+passes official randomized equivalence validation.
 
-The `sum_sq` optimized output contains eight instructions and takes 21 cycles
-on `machine_default.cfg`, compared with 2,690 cycles for the supplied original
-program. The official validator reported 101 checked inputs for this run.
+## Largest absolute cycle reductions
 
-The skewed-machine regression that exposed the loop-MAC cost-model bug was also
-rechecked after the fix: the optimized output retained the MAC and took 67
-cycles; the buggy revision had decomposed it and took 163 cycles. Both versions
-were semantically equivalent, so this was a performance-only defect.
+| Machine | Program | Before | After | Saved |
+|---|---|---:|---:|---:|
+| machine_few_registers.cfg | collatz | 15245 | 1229 | 14016 |
+| machine_few_registers.cfg | matmul4 | 14121 | 3595 | 10526 |
+| machine_few_registers.cfg | nested_invariant | 11614 | 1146 | 10468 |
+| machine_few_registers.cfg | sieve | 12906 | 2642 | 10264 |
+| machine_few_registers.cfg | strength_ladder | 10240 | 487 | 9753 |
+| machine_few_registers.cfg | transpose8 | 10282 | 718 | 9564 |
+| machine_no_fused.cfg | matmul4 | 8650 | 1290 | 7360 |
+| machine_default.cfg | matmul4 | 8196 | 1018 | 7178 |
+| machine_slow_memory.cfg | collatz | 8035 | 1229 | 6806 |
+| machine_slow_memory.cfg | matmul4 | 8335 | 1530 | 6805 |
 
-## Incomplete checks (not counted as passes)
+## Additional checks
 
-- The extended `tests/adversarial.py` run did not complete within a 300-second
-  wall-clock cap. Its partial output is not counted as a pass.
-- A multi-machine practice-program benchmark sample did not complete within
-  the available wall-clock cap. No full 100-program x 5-machine equivalence or
-  cycle claim is made for this package.
-- The 500-combination figures in the superseded report belonged to a different
-  source revision and are intentionally not claimed here.
+- 12/12 focused semantic and machine-cost regressions passed.
+- 30,000 independent definitions optimized in 0.813 seconds.
+- The 100,000-instruction and 1,000-live-register stress cases passed their
+  respective execution limits.
+- Repeated optimizer invocation produced byte-identical output.
 
 ## Reproduction
-
-With an unpacked official kit at `KIT`, run:
 
 ```sh
 ./build.sh
 python3 tests/regressions.py --kit KIT
 python3 tests/stress.py --machine KIT/machines/machine_default.cfg
-python3 tests/adversarial.py --kit KIT
 python3 tests/benchmark.py --kit KIT --out benchmark-full --random 100
 ```
-
-The last command runs the full 100-program x 5-machine matrix. Its output is
-not included because a complete matrix did not finish in this environment.

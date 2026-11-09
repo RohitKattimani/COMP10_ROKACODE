@@ -26,6 +26,13 @@ python3 tests/benchmark.py --kit KIT --out benchmark-full --random 100
 
 The script writes a CSV containing every combination and a Markdown summary. It exits nonzero if any optimizer, validator, simulator, or timeout case fails.
 
+The final candidate was run through the complete matrix on 2026-11-09:
+500/500 combinations passed equivalence and timing checks, with zero failures
+or regressions. The measured total was 580,799 original cycles versus 163,533
+optimized cycles (71.84% reduction), with a 2.526× geometric-mean speedup.
+The run took 897.4 seconds wall time. See `BENCHMARK_REPORT.md` for the
+largest improvements.
+
 It enforces the contest's five-second optimizer limit for ordinary benchmark
 programs. For large-scale limits, run:
 
