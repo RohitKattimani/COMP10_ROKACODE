@@ -8,6 +8,7 @@ constant divisor.
 """
 import argparse
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 MASK = 0xffffffff
@@ -96,112 +97,187 @@ def evalop(op, x):
     raise ValueError(op)
 
 def rewrite_block(b):
-    """Local constant/copy propagation; no facts cross a control-flow edge."""
-    env={}
+    """Local constant/copy propagation with indexed invalidation.
+
+    The alias map is kept flat: a newly created copy is first resolved to the
+    current source value.  Reverse links let a redefinition invalidate only
+    aliases that actually refer to that register, rather than scanning the
+    whole environment for every instruction.
+    """
+    env = {}
+    aliases_by_source = defaultdict(set)
+
+    def unbind(reg):
+        old = env.pop(reg, None)
+        if old is not None:
+            aliases_by_source[old].discard(reg)
+        # Copies of the old value are no longer valid after this definition.
+        for alias in aliases_by_source.pop(reg, ()):
+            env.pop(alias, None)
+
     for i in b.ins:
-        sig=SIG[i.op]
-        for n,(k,x) in enumerate(zip(sig,i.a)):
-            if k == 's' and x in env:
-                # The map only contains current aliases, but chasing also
-                # handles a short chain of copies without creating new names.
-                while i.a[n] in env: i.a[n]=env[i.a[n]]
-        d=dest(i)
+        sig = SIG[i.op]
+        for n, (kind, operand) in enumerate(zip(sig, i.a)):
+            if kind == 's' and operand in env:
+                i.a[n] = env[operand]
+        d = dest(i)
         if d:
-            env.pop(d,None)
-            # A copied register ceases to name the old value when its source
-            # is overwritten.  This is what makes the local map sound for
-            # ordinary (non-SSA) KIR.
-            for k in [k for k,v in env.items() if v == d]: del env[k]
-        # Fold total pure operators and a provably non-trapping div/mod.
-        values=[]; allconst=True
-        for k,x in zip(sig,i.a):
-            if k in ('s','i','k'):
-                if is_lit(x): values.append(val(x))
-                else: allconst=False; break
-        foldable = i.op in PURE or (i.op in ('div','mod') and allconst and values[1] != 0)
+            unbind(d)
+        values = []
+        allconst = True
+        for kind, operand in zip(sig, i.a):
+            if kind in ('s', 'i', 'k'):
+                if is_lit(operand):
+                    values.append(val(operand))
+                else:
+                    allconst = False
+                    break
+        foldable = i.op in PURE or (i.op in ('div', 'mod') and allconst and values[1] != 0)
         if d and allconst and foldable:
-            # Evaluate before changing the opcode.  Folding `add 5, 7` as a
-            # `mov` would silently return 5 rather than 12.
             original_op = i.op
             result = evalop('mov' if original_op == 'const' else original_op, values)
-            i.op='const'; i.a=[d,fmt(result)]
+            i.op = 'const'
+            i.a = [d, fmt(result)]
         elif d:
-            # Identities valid for modular arithmetic, all without effects.
-            a=i.a
-            if i.op == 'mov': pass
-            elif i.op in ('add','or','xor') and is_lit(a[2]) and val(a[2]) == 0: i.op='mov'; i.a=[d,a[1]]
-            elif i.op == 'add' and is_lit(a[1]) and val(a[1]) == 0: i.op='mov'; i.a=[d,a[2]]
-            elif i.op == 'sub' and is_lit(a[2]) and val(a[2]) == 0: i.op='mov'; i.a=[d,a[1]]
-            elif i.op == 'mul' and ((is_lit(a[1]) and val(a[1]) == 0) or (is_lit(a[2]) and val(a[2]) == 0)): i.op='const'; i.a=[d,'0']
-            elif i.op == 'mul' and is_lit(a[2]) and val(a[2]) == 1: i.op='mov'; i.a=[d,a[1]]
-            elif i.op == 'mul' and is_lit(a[1]) and val(a[1]) == 1: i.op='mov'; i.a=[d,a[2]]
-            elif i.op == 'and' and ((is_lit(a[1]) and val(a[1]) == 0) or (is_lit(a[2]) and val(a[2]) == 0)): i.op='const'; i.a=[d,'0']
-            elif i.op in ('shl','shr') and is_lit(a[2]) and (val(a[2])&31)==0: i.op='mov'; i.a=[d,a[1]]
-            elif i.op in ('eq','lt') and a[1] == a[2]:
-                same_op=i.op; i.op='const'; i.a=[d, '1' if same_op=='eq' else '0']
-            elif i.op == 'select' and a[2] == a[3]: i.op='mov'; i.a=[d,a[2]]
-            elif i.op == 'div' and is_lit(a[2]) and val(a[2]) == 1: i.op='mov'; i.a=[d,a[1]]
-            elif i.op == 'mod' and is_lit(a[2]) and val(a[2]) in (1,MASK): i.op='const'; i.a=[d,'0']
-        if d and i.op == 'const': env[d]=i.a[1]
-        elif d and i.op == 'mov' and i.a[1] != d: env[d]=i.a[1]
-        elif d: env.pop(d,None)
-    # Constant conditions turn into direct jumps, enabling reachability removal.
-    t=b.ins[-1]
-    if t.op == 'br' and is_lit(t.a[0]): b.ins[-1]=Ins('jmp',[t.a[1] if val(t.a[0]) else t.a[2]])
+            a = i.a
+            if i.op == 'mov':
+                pass
+            elif i.op in ('add', 'or', 'xor') and is_lit(a[2]) and val(a[2]) == 0:
+                i.op = 'mov'; i.a = [d, a[1]]
+            elif i.op == 'add' and is_lit(a[1]) and val(a[1]) == 0:
+                i.op = 'mov'; i.a = [d, a[2]]
+            elif i.op == 'sub' and is_lit(a[2]) and val(a[2]) == 0:
+                i.op = 'mov'; i.a = [d, a[1]]
+            elif i.op == 'mul' and ((is_lit(a[1]) and val(a[1]) == 0) or (is_lit(a[2]) and val(a[2]) == 0)):
+                i.op = 'const'; i.a = [d, '0']
+            elif i.op == 'mul' and is_lit(a[2]) and val(a[2]) == 1:
+                i.op = 'mov'; i.a = [d, a[1]]
+            elif i.op == 'mul' and is_lit(a[1]) and val(a[1]) == 1:
+                i.op = 'mov'; i.a = [d, a[2]]
+            elif i.op == 'and' and ((is_lit(a[1]) and val(a[1]) == 0) or (is_lit(a[2]) and val(a[2]) == 0)):
+                i.op = 'const'; i.a = [d, '0']
+            elif i.op in ('shl', 'shr') and is_lit(a[2]) and (val(a[2]) & 31) == 0:
+                i.op = 'mov'; i.a = [d, a[1]]
+            elif i.op in ('eq', 'lt') and a[1] == a[2]:
+                same_op = i.op; i.op = 'const'; i.a = [d, '1' if same_op == 'eq' else '0']
+            elif i.op == 'select' and a[2] == a[3]:
+                i.op = 'mov'; i.a = [d, a[2]]
+            elif i.op == 'div' and is_lit(a[2]) and val(a[2]) == 1:
+                i.op = 'mov'; i.a = [d, a[1]]
+            elif i.op == 'mod' and is_lit(a[2]) and val(a[2]) in (1, MASK):
+                i.op = 'const'; i.a = [d, '0']
+        if d and i.op == 'const':
+            env[d] = i.a[1]
+            aliases_by_source[i.a[1]].add(d)
+        elif d and i.op == 'mov' and i.a[1] != d:
+            env[d] = i.a[1]
+            aliases_by_source[i.a[1]].add(d)
+    t = b.ins[-1]
+    if t.op == 'br' and is_lit(t.a[0]):
+        b.ins[-1] = Ins('jmp', [t.a[1] if val(t.a[0]) else t.a[2]])
+
+
+def _drop_indexed_entry(table, by_operand, by_result, key):
+    result = table.pop(key, None)
+    if result is None:
+        return
+    by_result[result].discard(key)
+    for operand in key[1:]:
+        if REG.match(operand):
+            by_operand[operand].discard(key)
+
+
+def local_cse_and_load_forwarding(blocks):
+    """Local CSE/load forwarding with O(total invalidations) cache upkeep."""
+    for b in blocks:
+        expr = {}
+        expr_by_operand = defaultdict(set)
+        expr_by_result = defaultdict(set)
+        loads = {}
+        load_by_operand = defaultdict(set)
+        load_by_result = defaultdict(set)
+
+        def kill_load(key):
+            result = loads.pop(key, None)
+            if result is None:
+                return
+            load_by_result[result].discard(key)
+            for operand in key:
+                if REG.match(operand):
+                    load_by_operand[operand].discard(key)
+
+        for i in b.ins:
+            d = dest(i)
+            if d:
+                expr_keys = set(expr_by_operand.pop(d, ())) | set(expr_by_result.pop(d, ()))
+                for key in expr_keys:
+                    _drop_indexed_entry(expr, expr_by_operand, expr_by_result, key)
+                load_keys = set(load_by_operand.pop(d, ())) | set(load_by_result.pop(d, ()))
+                for key in load_keys:
+                    kill_load(key)
+            if i.op == 'store':
+                loads.clear()
+                load_by_operand.clear()
+                load_by_result.clear()
+                continue
+            if i.op == 'load':
+                key = tuple(i.a[1:])
+                if key in loads:
+                    i.op = 'mov'
+                    i.a = [i.a[0], loads[key]]
+                elif not any(operand == d and REG.match(operand) for operand in key):
+                    # A load that overwrites its own address register changes
+                    # the meaning of that register for every later load.
+                    loads[key] = i.a[0]
+                    load_by_result[i.a[0]].add(key)
+                    for operand in key:
+                        if REG.match(operand):
+                            load_by_operand[operand].add(key)
+                continue
+            if i.op not in PURE or not d:
+                continue
+            args = tuple(i.a[1:])
+            if i.op in COMMUTATIVE:
+                args = tuple(sorted(args))
+            key = (i.op,) + args
+            if key in expr:
+                i.op = 'mov'
+                i.a = [d, expr[key]]
+            elif not any(operand == d and REG.match(operand) for operand in args):
+                # Do not cache an expression under an input register that the
+                # same instruction just overwrote (KIR is not SSA).
+                expr[key] = d
+                expr_by_result[d].add(key)
+                for operand in args:
+                    if REG.match(operand):
+                        expr_by_operand[operand].add(key)
 
 def fuse(blocks, machine):
-    _, liveout=liveness(blocks)
+    _, liveout = liveness(blocks)
     for b in blocks:
-        out=[]; j=0
+        last_use = {}
+        for pos, ins in enumerate(b.ins):
+            for reg in uses(ins):
+                last_use[reg] = pos
+        out = []; j = 0
         while j < len(b.ins):
             x=b.ins[j]
             if j+1 < len(b.ins):
                 y=b.ins[j+1]; td=dest(x)
-                if (td and x.op == 'mul' and machine.get('fused_mac',0) and y.op == 'add' and
-                    y.a[1:].count(td)==1 and td not in liveout[b.label] and not any(td in uses(z) for z in b.ins[j+2:])):
+                if (td and x.op == 'mul' and machine.get('fused_mac',0) and
+                    machine.get('lat_mac', 1) <= machine.get('lat_mul', 1) + machine.get('lat_alu', 1) and y.op == 'add' and
+                    y.a[1:].count(td)==1 and td not in liveout[b.label] and last_use.get(td, -1) <= j+1):
                     other=y.a[2] if y.a[1]==td else y.a[1]
                     out.append(Ins('mac',[y.a[0],x.a[1],x.a[2],other])); j+=2; continue
-                if (td and x.op == 'shl' and machine.get('fused_addsh',0) and is_lit(x.a[2]) and
+                if (td and x.op == 'shl' and machine.get('fused_addsh',0) and
+                    machine.get('lat_addsh', 1) <= 2 * machine.get('lat_alu', 1) and is_lit(x.a[2]) and
                     0 <= val(x.a[2]) <= 31 and y.op == 'add' and y.a[1:].count(td)==1 and
-                    td not in liveout[b.label] and not any(td in uses(z) for z in b.ins[j+2:])):
+                    td not in liveout[b.label] and last_use.get(td, -1) <= j+1):
                     other=y.a[2] if y.a[1]==td else y.a[1]
                     out.append(Ins('addsh',[y.a[0],other,x.a[1],str(val(x.a[2]))])); j+=2; continue
             out.append(x); j+=1
         b.ins=out
 
-def local_cse_and_load_forwarding(blocks):
-    """Eliminate repeated pure expressions and repeated loads within a block.
-
-    Expression entries are invalidated on a redefinition of any operand.
-    A repeated `load` is replaced only if no intervening data store occurred;
-    the first identical load has already established that its address is valid.
-    """
-    for b in blocks:
-        expr={}; loads={}
-        for i in b.ins:
-            d=dest(i)
-            if d:
-                # No cached result may retain the old value of this register.
-                expr={k:v for k,v in expr.items() if d not in k[1:] and v != d}
-                loads={k:v for k,v in loads.items() if d not in k and v != d}
-            if i.op == 'store':
-                loads.clear()
-                continue
-            if i.op == 'load':
-                key=tuple(i.a[1:])
-                if key in loads:
-                    i.op='mov'; i.a=[i.a[0],loads[key]]
-                else:
-                    loads[key]=i.a[0]
-                continue
-            if i.op not in PURE or not d: continue
-            args=tuple(i.a[1:])
-            if i.op in COMMUTATIVE: args=tuple(sorted(args))
-            key=(i.op,)+args
-            if key in expr:
-                i.op='mov'; i.a=[d,expr[key]]
-            else:
-                expr[key]=d
 
 def strength_reduce_constants(blocks, mc):
     """Use exact unsigned modular identities when the target makes them win."""
@@ -238,28 +314,30 @@ def liveness(blocks):
     return livein, liveout
 
 def coalesce_adjacent_copies(blocks):
-    """Fold `producer t; mov final,t` into a write directly to `final`.
-
-    This is a semantic register allocation step: it reduces both instructions
-    and distinct register names, but only when the temporary is dead on every
-    successor path.  Sources are read before a destination write in KIR, so a
-    producer is also allowed to write a register it reads itself.
-    """
+    """Fold a producer and its sole adjacent copy into one destination."""
     _, liveout = liveness(blocks)
     for b in blocks:
-        out=[]; p=0
+        last_use = {}
+        for pos, ins in enumerate(b.ins):
+            for reg in uses(ins):
+                last_use[reg] = pos
+        out = []
+        p = 0
         while p < len(b.ins):
-            x=b.ins[p]
-            if p+1 < len(b.ins):
-                y=b.ins[p+1]; tmp=dest(x)
+            x = b.ins[p]
+            if p + 1 < len(b.ins):
+                y = b.ins[p + 1]
+                tmp = dest(x)
                 if (x.op in PURE and tmp and y.op == 'mov' and y.a[1] == tmp and
-                    y.a[0] != tmp and tmp not in liveout[b.label] and
-                    not any(tmp in uses(z) for z in b.ins[p+2:])):
-                    x.a[0]=y.a[0]
-                    out.append(x); p+=2
+                        y.a[0] != tmp and tmp not in liveout[b.label] and
+                        last_use.get(tmp, -1) <= p + 1):
+                    x.a[0] = y.a[0]
+                    out.append(x)
+                    p += 2
                     continue
-            out.append(x); p+=1
-        b.ins=out
+            out.append(x)
+            p += 1
+        b.ins = out
 
 def compact_registers(params, blocks):
     """Colour the global interference graph and reuse virtual register names.
@@ -275,12 +353,36 @@ def compact_registers(params, blocks):
             if dest(i): nodes.add(dest(i))
             nodes.update(uses(i))
     if not nodes: return params
-    _, out=liveness(blocks); edges={x:set() for x in nodes}
+    livein, out=liveness(blocks)
+    # Interference is necessarily dense when many values are simultaneously
+    # live.  Since compaction is optional, avoid an unbounded quadratic graph
+    # allocation on pathological high-pressure inputs.
+    edge_work = 0
+    for block in blocks:
+        live = set(out[block.label])
+        for ins in reversed(block.ins):
+            d = dest(ins)
+            if d:
+                edge_work += len(live)
+                if edge_work > 1_500_000:
+                    return params
+                live.discard(d)
+            live.update(uses(ins))
+    edges={x:set() for x in nodes}
     def clique(xs):
         xs=sorted(xs, key=lambda z:int(z[1:]))
         for n,x in enumerate(xs):
             for y in xs[n+1:]: edges[x].add(y); edges[y].add(x)
     clique(params)
+    # At function entry, parameters hold independent inputs while every
+    # non-parameter register holds zero.  Any non-parameter value live before
+    # its first definition must therefore interfere with every live parameter.
+    entry_live = livein[blocks[0].label]
+    for x in entry_live:
+        if x not in params:
+            for p in params:
+                edges[x].add(p)
+                edges[p].add(x)
     for b in blocks:
         live=set(out[b.label])
         for i in reversed(b.ins):
@@ -307,92 +409,121 @@ def compact_registers(params, blocks):
                 if kind in ('d','s') and x in rename: i.a[n]=rename[x]
     return [rename[x] for x in params]
 
-def simple_licm(blocks):
-    """Hoist proven-pure invariants from canonical two-block loops.
+def simple_licm(blocks, mc=None):
+    """Hoist pure invariants from canonical two-block loops conservatively.
 
-    We intentionally accept only `preheader -> head -> body -> head` loops.
-    This excludes irreducible and multi-entry graphs, and makes dominance and
-    effect ordering explicit.  A candidate cannot be read outside the loop,
-    so executing it on a zero-trip loop cannot change an observable result.
+    A candidate must have exactly one definition in the loop and that
+    definition must precede every loop use.  These conditions are essential
+    for non-SSA KIR: multiple assignments to one register are not one
+    loop-invariant value.
     """
-    by={b.label:b for b in blocks}; pred={b.label:[] for b in blocks}
-    for a,targets in successors(blocks).items():
-        for t in targets: pred[t].append(a)
-    used={x for b in blocks for i in b.ins for x in ([dest(i)] if dest(i) else [])+uses(i)}
-    next_id=max([int(x[1:]) for x in used] + [-1]) + 1
+    by = {b.label: b for b in blocks}
+    pred = {b.label: [] for b in blocks}
+    for source, targets in successors(blocks).items():
+        for target in targets:
+            pred[target].append(source)
+    used = {x for block in blocks for ins in block.ins
+            for x in ([dest(ins)] if dest(ins) else []) + uses(ins)}
+    next_id = max([int(x[1:]) for x in used] + [-1]) + 1
+    latency_profitable_mac = (mc or {}).get('lat_alu', 1) < (mc or {}).get('lat_mac', 1)
+
     for head in blocks:
-        term=head.ins[-1]
-        if term.op != 'br': continue
+        term = head.ins[-1]
+        if term.op != 'br':
+            continue
         for body_label in term.a[1:]:
-            if body_label not in by: continue
-            body=by[body_label]
-            if body.ins[-1].op != 'jmp' or body.ins[-1].a[0] != head.label: continue
-            if pred[body.label] != [head.label]: continue
-            pre=[p for p in pred[head.label] if p != body.label]
-            if len(pre) != 1 or by[pre[0]].ins[-1].op != 'jmp': continue
-            preblock=by[pre[0]]
-            loopdefs={dest(i) for b in (head,body) for i in b.ins if dest(i)}
-            outside=[b for b in blocks if b not in (head,body)]
-            outside_uses={x for b in outside for i in b.ins for x in uses(i)}
-            invariant=set(x for x in used if x not in loopdefs)
-            # A hoisted definition must not change a value observed before
-            # that definition in the first loop iteration.  Require a unique
-            # loop definition and no earlier read in the head/body ordering.
-            defcount={}
-            for lb in (head,body):
-                for ins in lb.ins:
-                    d0=dest(ins)
-                    if d0: defcount[d0]=defcount.get(d0,0)+1
-            head_reads={x for ins in head.ins for x in uses(ins)}
-            reads_before={}; seen=set()
-            for ins in body.ins[:-1]:
-                reads_before[id(ins)]=set(seen)
-                seen.update(uses(ins))
-            moved=[]; todo=list(body.ins[:-1]); changed=True
-            # Fixed point admits an invariant expression that depends on an
-            # invariant expression immediately above it in the same body.
+            if body_label not in by:
+                continue
+            body = by[body_label]
+            if body.ins[-1].op != 'jmp' or body.ins[-1].a[0] != head.label:
+                continue
+            if pred[body.label] != [head.label]:
+                continue
+            pre = [p for p in pred[head.label] if p != body.label]
+            if len(pre) != 1 or by[pre[0]].ins[-1].op != 'jmp':
+                continue
+            preblock = by[pre[0]]
+            loop_blocks = (head, body)
+            loop_def_counts = Counter(dest(ins) for block in loop_blocks for ins in block.ins if dest(ins))
+            outside = [block for block in blocks if block not in loop_blocks]
+            outside_uses = {x for block in outside for ins in block.ins for x in uses(ins)}
+            head_uses = {x for ins in head.ins for x in uses(ins)}
+            invariant = set(x for x in used if loop_def_counts.get(x, 0) == 0)
+            moved = []
+            body_positions = {id(ins): pos for pos, ins in enumerate(body.ins[:-1])}
+            first_body_use = {}
+            for pos, ins in enumerate(body.ins[:-1]):
+                for reg in uses(ins):
+                    first_body_use.setdefault(reg, pos)
+            todo = list(body.ins[:-1])
+            changed = True
             while changed and todo:
-                changed=False; next_kept=[]
-                for i in todo:
-                    d=dest(i)
-                    if (i.op in PURE and d and d not in outside_uses and
-                        defcount.get(d,0)==1 and d not in head_reads and
-                        d not in reads_before[id(i)] and
-                        all(x in invariant for x in uses(i))):
-                        moved.append(i); invariant.add(d); changed=True
-                    else: next_kept.append(i)
-                todo=next_kept
-            if not moved: continue
-            body.ins=todo+[body.ins[-1]]
-            preblock.ins[-1:-1]=moved
-            # Once x*x is invariant, turn acc += x*x from a recurrent mac
-            # into one preheader multiply plus a cheap add per iteration.
-            transformed=[]; p=0; work=body.ins[:-1]
-            while p < len(work):
-                i=work[p]
-                # mac t,x,x,acc ; add acc,t,step
-                # becomes: preheader mul square,x,x ; add acc,acc,square ;
-                #          add acc,acc,step.  The temporary must have no
-                # other use, so the replacement is exact modular arithmetic.
-                if (p+1 < len(work) and i.op == 'mac' and i.a[1] == i.a[2] and i.a[1] in invariant and
-                    i.a[0] != i.a[3] and work[p+1].op == 'add' and
-                    work[p+1].a[1:].count(i.a[0]) == 1 and work[p+1].a[0] == i.a[3] and
-                    not any(i.a[0] in uses(z) for z in work[p+2:])):
-                    step=work[p+1].a[2] if work[p+1].a[1] == i.a[0] else work[p+1].a[1]
-                    if step == i.a[0] or step == i.a[3]:
-                        transformed.append(i); p+=1; continue
-                    tmp='v%d' % next_id; next_id+=1; used.add(tmp); invariant.add(tmp)
-                    preblock.ins.insert(-1, Ins('mul',[tmp,i.a[1],i.a[2]]))
-                    transformed.append(Ins('add',[i.a[3],i.a[3],tmp]))
-                    transformed.append(Ins('add',[i.a[3],i.a[3],step]))
-                    p+=2; continue
-                if i.op == 'mac' and i.a[1] == i.a[2] and i.a[0] == i.a[3] and i.a[1] in invariant:
-                    tmp='v%d' % next_id; next_id+=1; used.add(tmp); invariant.add(tmp)
-                    preblock.ins.insert(-1, Ins('mul',[tmp,i.a[1],i.a[2]]))
-                    transformed.append(Ins('add',[i.a[0],i.a[0],tmp]))
-                else: transformed.append(i)
-                p+=1
-            body.ins=transformed+[body.ins[-1]]
+                changed = False
+                next_kept = []
+                for ins in todo:
+                    d = dest(ins)
+                    if not (ins.op in PURE and d and loop_def_counts[d] == 1 and
+                            d not in outside_uses and d not in head_uses and
+                            all(x in invariant for x in uses(ins))):
+                        next_kept.append(ins)
+                        continue
+                    # The value written by this instruction may only be read
+                    # after its unique loop definition; it cannot stand in for
+                    # an incoming/previous-iteration value.
+                    def_pos = body_positions[id(ins)]
+                    if first_body_use.get(d, def_pos + 1) <= def_pos:
+                        next_kept.append(ins)
+                        continue
+                    moved.append(ins)
+                    invariant.add(d)
+                    changed = True
+                todo = next_kept
+            if not moved:
+                continue
+            body.ins = todo + [body.ins[-1]]
+            preblock.ins[-1:-1] = moved
+
+            # Track every use of a potential MAC temporary across the entire
+            # function, not just the remaining suffix of the loop body.
+            use_sites = defaultdict(list)
+            for block in blocks:
+                for ins in block.ins:
+                    for reg in uses(ins):
+                        use_sites[reg].append(ins)
+
+            transformed = []
+            pos = 0
+            work = body.ins[:-1]
+            while pos < len(work):
+                ins = work[pos]
+                if (latency_profitable_mac and pos + 1 < len(work) and ins.op == 'mac' and
+                        ins.a[1] == ins.a[2] and ins.a[1] in invariant and ins.a[0] != ins.a[3] and
+                        work[pos + 1].op == 'add' and work[pos + 1].a[1:].count(ins.a[0]) == 1 and
+                        work[pos + 1].a[0] == ins.a[3] and
+                        len(use_sites.get(ins.a[0], ())) == 1 and use_sites[ins.a[0]][0] is work[pos + 1]):
+                    step = work[pos + 1].a[2] if work[pos + 1].a[1] == ins.a[0] else work[pos + 1].a[1]
+                    if step != ins.a[0] and step != ins.a[3]:
+                        tmp = 'v%d' % next_id
+                        next_id += 1
+                        used.add(tmp)
+                        invariant.add(tmp)
+                        preblock.ins.insert(-1, Ins('mul', [tmp, ins.a[1], ins.a[2]]))
+                        transformed.append(Ins('add', [ins.a[3], ins.a[3], tmp]))
+                        transformed.append(Ins('add', [ins.a[3], ins.a[3], step]))
+                        pos += 2
+                        continue
+                if (latency_profitable_mac and ins.op == 'mac' and ins.a[1] == ins.a[2] and
+                        ins.a[0] == ins.a[3] and ins.a[1] in invariant):
+                    tmp = 'v%d' % next_id
+                    next_id += 1
+                    used.add(tmp)
+                    invariant.add(tmp)
+                    preblock.ins.insert(-1, Ins('mul', [tmp, ins.a[1], ins.a[2]]))
+                    transformed.append(Ins('add', [ins.a[0], ins.a[0], tmp]))
+                else:
+                    transformed.append(ins)
+                pos += 1
+            body.ins = transformed + [body.ins[-1]]
 
 def induction_strength_reduce(blocks, mc):
     """Replace signed div/mod for a proved non-negative counting IV only."""
@@ -554,7 +685,7 @@ def main():
     simplify_cfg(blocks)
     # Removing copy temporaries first exposes adjacent producer/consumer
     # pairs to the strictly local fused-instruction matcher.
-    blocks=reachable(blocks); eliminate_dead(blocks); coalesce_adjacent_copies(blocks); fuse(blocks,mc); coalesce_adjacent_copies(blocks); eliminate_dead(blocks); closed_form_square_sum(blocks); blocks=reachable(blocks); simple_licm(blocks); induction_strength_reduce(blocks,mc)
+    blocks=reachable(blocks); eliminate_dead(blocks); coalesce_adjacent_copies(blocks); fuse(blocks,mc); coalesce_adjacent_copies(blocks); eliminate_dead(blocks); closed_form_square_sum(blocks); blocks=reachable(blocks); simple_licm(blocks,mc); induction_strength_reduce(blocks,mc)
     # New eliminations can expose another safe simplification, but no pass depends on profiles.
     for b in blocks: rewrite_block(b)
     local_cse_and_load_forwarding(blocks)
