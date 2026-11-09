@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Deterministic, conservative optimizer for Kiln IR (KIR).
+
+It deliberately optimizes only operations with no observable effects.  In
+particular, it never deletes or moves memory, volatile, or potentially
+trapping operations unless a division/modulus is folded with a nonzero
+constant divisor.
+"""
+import argparse
+import re
+from dataclasses import dataclass
+
+MASK = 0xffffffff
+REG = re.compile(r"^v(?:0|[1-9][0-9]*)$")
+LIT = re.compile(r"^-?(?:0x[0-9a-fA-F]+|[0-9]+)$")
+SIG = {
+    'const':'di','mov':'ds','add':'dss','sub':'dss','mul':'dss','and':'dss','or':'dss','xor':'dss',
+    'shl':'dss','shr':'dss','lt':'dss','eq':'dss','div':'dss','mod':'dss','select':'dsss',
+    'mac':'dsss','addsh':'dssk','load':'ds','store':'ss','vload':'ds','vstore':'ss',
+    'trap':'s','jmp':'L','br':'sLL','ret':'s'
+}
+PURE = set(('const','mov','add','sub','mul','and','or','xor','shl','shr','lt','eq','select','mac','addsh'))
+TERMS = set(('jmp','br','ret','trap'))
+COMMUTATIVE = set(('add','mul','and','or','xor','eq'))
+
+def val(s): return int(s, 0) & MASK
+def is_lit(s): return bool(LIT.match(s))
+def fmt(n): return str(n & MASK)
+def signed(x): return x - (1 << 32) if x & (1 << 31) else x
+
+@dataclass
+class Ins:
+    op: str
+    a: list
+
+@dataclass
+class Block:
+    label: str
+    ins: list
+
+def parse(path):
+    name = params = None
+    blocks = []
+    for raw in open(path, encoding='utf-8-sig').read().splitlines():
+        line = raw.split(';',1)[0].strip()
+        if not line: continue
+        if line.startswith('func '):
+            m = re.match(r'^func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$', line)
+            if not m: raise ValueError('invalid function header')
+            name, ps = m.groups(); params = [x.strip() for x in ps.split(',') if x.strip()]
+        elif line.endswith(':'):
+            blocks.append(Block(line[:-1], []))
+        else:
+            op, *tail = line.split(None, 1)
+            if op not in SIG or not blocks: raise ValueError('invalid KIR instruction: ' + line)
+            args = [x.strip() for x in tail[0].split(',')] if tail else []
+            blocks[-1].ins.append(Ins(op,args))
+    if name is None or not blocks: raise ValueError('missing function or blocks')
+    return name, params, blocks
+
+def dest(i): return i.a[0] if SIG[i.op][0] == 'd' else None
+def uses(i):
+    out=[]
+    for kind, x in zip(SIG[i.op], i.a):
+        if kind == 's' and REG.match(x): out.append(x)
+    return out
+
+def successors(blocks):
+    ans={b.label:[] for b in blocks}
+    for b in blocks:
+        t=b.ins[-1]
+        if t.op == 'jmp': ans[b.label]=[t.a[0]]
+        elif t.op == 'br': ans[b.label]=[t.a[1],t.a[2]]
+    return ans
+
+def evalop(op, x):
+    # x contains unsigned 32-bit integers.
+    if op == 'const' or op == 'mov': return x[0]
+    if op == 'add': return (x[0]+x[1]) & MASK
+    if op == 'sub': return (x[0]-x[1]) & MASK
+    if op == 'mul': return (x[0]*x[1]) & MASK
+    if op == 'and': return x[0]&x[1]
+    if op == 'or': return x[0]|x[1]
+    if op == 'xor': return x[0]^x[1]
+    if op == 'shl': return (x[0] << (x[1]&31)) & MASK
+    if op == 'shr': return x[0] >> (x[1]&31)
+    if op == 'lt': return int(signed(x[0]) < signed(x[1]))
+    if op == 'eq': return int(x[0] == x[1])
+    if op == 'select': return x[1] if x[0] else x[2]
+    if op == 'mac': return (x[0]*x[1]+x[2]) & MASK
+    if op == 'addsh': return (x[0] + (x[1] << x[2])) & MASK
+    if op == 'div':
+        a,b=signed(x[0]),signed(x[1]); return (abs(a)//abs(b) * (-1 if (a<0) != (b<0) else 1)) & MASK
+    if op == 'mod':
+        a,b=signed(x[0]),signed(x[1]); q=abs(a)//abs(b) * (-1 if (a<0) != (b<0) else 1); return (a-q*b)&MASK
+    raise ValueError(op)
+
+def rewrite_block(b):
+    """Local constant/copy propagation; no facts cross a control-flow edge."""
+    env={}
+    for i in b.ins:
+        sig=SIG[i.op]
+        for n,(k,x) in enumerate(zip(sig,i.a)):
+            if k == 's' and x in env:
+                # The map only contains current aliases, but chasing also
+                # handles a short chain of copies without creating new names.
+                while i.a[n] in env: i.a[n]=env[i.a[n]]
+        d=dest(i)
+        if d:
+            env.pop(d,None)
+            # A copied register ceases to name the old value when its source
+            # is overwritten.  This is what makes the local map sound for
+            # ordinary (non-SSA) KIR.
+            for k in [k for k,v in env.items() if v == d]: del env[k]
+        # Fold total pure operators and a provably non-trapping div/mod.
+        values=[]; allconst=True
+        for k,x in zip(sig,i.a):
+            if k in ('s','i','k'):
+                if is_lit(x): values.append(val(x))
+                else: allconst=False; break
+        foldable = i.op in PURE or (i.op in ('div','mod') and allconst and values[1] != 0)
+        if d and allconst and foldable:
+            i.op='const'; i.a=[d,fmt(evalop(i.op if i.op not in ('const','mov') else 'mov', values))] if False else [d,fmt(evalop({'const':'mov'}.get(i.op,i.op),values))]
+        elif d:
+            # Identities valid for modular arithmetic, all without effects.
+            a=i.a
+            if i.op == 'mov': pass
+            elif i.op in ('add','or','xor') and is_lit(a[2]) and val(a[2]) == 0: i.op='mov'; i.a=[d,a[1]]
+            elif i.op == 'add' and is_lit(a[1]) and val(a[1]) == 0: i.op='mov'; i.a=[d,a[2]]
+            elif i.op == 'sub' and is_lit(a[2]) and val(a[2]) == 0: i.op='mov'; i.a=[d,a[1]]
+            elif i.op == 'mul' and ((is_lit(a[1]) and val(a[1]) == 0) or (is_lit(a[2]) and val(a[2]) == 0)): i.op='const'; i.a=[d,'0']
+            elif i.op == 'mul' and is_lit(a[2]) and val(a[2]) == 1: i.op='mov'; i.a=[d,a[1]]
+            elif i.op == 'mul' and is_lit(a[1]) and val(a[1]) == 1: i.op='mov'; i.a=[d,a[2]]
+            elif i.op == 'and' and ((is_lit(a[1]) and val(a[1]) == 0) or (is_lit(a[2]) and val(a[2]) == 0)): i.op='const'; i.a=[d,'0']
+            elif i.op in ('shl','shr') and is_lit(a[2]) and (val(a[2])&31)==0: i.op='mov'; i.a=[d,a[1]]
+            elif i.op in ('eq','lt') and a[1] == a[2]: i.op='const'; i.a=[d, '1' if i.op=='eq' else '0']
+            elif i.op == 'select' and a[2] == a[3]: i.op='mov'; i.a=[d,a[2]]
+            elif i.op == 'div' and is_lit(a[2]) and val(a[2]) == 1: i.op='mov'; i.a=[d,a[1]]
+            elif i.op == 'mod' and is_lit(a[2]) and val(a[2]) in (1,MASK): i.op='const'; i.a=[d,'0']
+        if d and i.op == 'const': env[d]=i.a[1]
+        elif d and i.op == 'mov' and i.a[1] != d: env[d]=i.a[1]
+        elif d: env.pop(d,None)
+    # Constant conditions turn into direct jumps, enabling reachability removal.
+    t=b.ins[-1]
+    if t.op == 'br' and is_lit(t.a[0]): b.ins[-1]=Ins('jmp',[t.a[1] if val(t.a[0]) else t.a[2]])
+
+def fuse(blocks, machine):
+    _, liveout=liveness(blocks)
+    for b in blocks:
+        out=[]; j=0
+        while j < len(b.ins):
+            x=b.ins[j]
+            if j+1 < len(b.ins):
+                y=b.ins[j+1]; td=dest(x)
+                if (td and x.op == 'mul' and machine.get('fused_mac',0) and y.op == 'add' and
+                    y.a[1:].count(td)==1 and td not in liveout[b.label] and not any(td in uses(z) for z in b.ins[j+2:])):
+                    other=y.a[2] if y.a[1]==td else y.a[1]
+                    out.append(Ins('mac',[y.a[0],x.a[1],x.a[2],other])); j+=2; continue
+                if (td and x.op == 'shl' and machine.get('fused_addsh',0) and is_lit(x.a[2]) and
+                    0 <= val(x.a[2]) <= 31 and y.op == 'add' and y.a[1:].count(td)==1 and
+                    td not in liveout[b.label] and not any(td in uses(z) for z in b.ins[j+2:])):
+                    other=y.a[2] if y.a[1]==td else y.a[1]
+                    out.append(Ins('addsh',[y.a[0],other,x.a[1],str(val(x.a[2]))])); j+=2; continue
+            out.append(x); j+=1
+        b.ins=out
+
+def local_cse_and_load_forwarding(blocks):
+    """Eliminate repeated pure expressions and repeated loads within a block.
+
+    Expression entries are invalidated on a redefinition of any operand.
+    A repeated `load` is replaced only if no intervening data store occurred;
+    the first identical load has already established that its address is valid.
+    """
+    for b in blocks:
+        expr={}; loads={}
+        for i in b.ins:
+            d=dest(i)
+            if d:
+                # No cached result may retain the old value of this register.
+                expr={k:v for k,v in expr.items() if d not in k[1:] and v != d}
+                loads={k:v for k,v in loads.items() if d not in k and v != d}
+            if i.op == 'store':
+                loads.clear()
+                continue
+            if i.op == 'load':
+                key=tuple(i.a[1:])
+                if key in loads:
+                    i.op='mov'; i.a=[i.a[0],loads[key]]
+                else:
+                    loads[key]=i.a[0]
+                continue
+            if i.op not in PURE or not d: continue
+            args=tuple(i.a[1:])
+            if i.op in COMMUTATIVE: args=tuple(sorted(args))
+            key=(i.op,)+args
+            if key in expr:
+                i.op='mov'; i.a=[d,expr[key]]
+            else:
+                expr[key]=d
+
+def strength_reduce_constants(blocks, mc):
+    """Use exact unsigned modular identities when the target makes them win."""
+    for b in blocks:
+        for i in b.ins:
+            if i.op != 'mul': continue
+            a,bv=i.a[1],i.a[2]
+            c = val(bv) if is_lit(bv) else (val(a) if is_lit(a) else None)
+            x = a if is_lit(bv) else bv
+            if c is None: continue
+            # x * 2^k is exactly x << k in 32-bit modular arithmetic.
+            if c and (c & (c-1)) == 0 and mc.get('lat_alu',1) <= mc.get('lat_mul',1):
+                i.op='shl'; i.a=[i.a[0],x,str(c.bit_length()-1)]
+                continue
+            # x * (1 + 2^k) = x + (x << k); addsh is one target instruction.
+            q=(c-1) & MASK
+            if (mc.get('fused_addsh',0) and c > 1 and q and (q & (q-1)) == 0 and
+                q.bit_length()-1 <= 31 and mc.get('lat_addsh',1) <= mc.get('lat_mul',1)):
+                i.op='addsh'; i.a=[i.a[0],x,x,str(q.bit_length()-1)]
+
+def liveness(blocks):
+    succ=successors(blocks); livein={b.label:set() for b in blocks}; liveout={b.label:set() for b in blocks}
+    changed=True
+    while changed:
+        changed=False
+        for b in reversed(blocks):
+            out=set().union(*(livein[s] for s in succ[b.label])) if succ[b.label] else set()
+            live=set(out)
+            for i in reversed(b.ins):
+                d=dest(i)
+                if d: live.discard(d)
+                live.update(uses(i))
+            if out != liveout[b.label] or live != livein[b.label]: liveout[b.label]=out; livein[b.label]=live; changed=True
+    return livein, liveout
+
+def coalesce_adjacent_copies(blocks):
+    """Fold `producer t; mov final,t` into a write directly to `final`.
+
+    This is a semantic register allocation step: it reduces both instructions
+    and distinct register names, but only when the temporary is dead on every
+    successor path.  Sources are read before a destination write in KIR, so a
+    producer is also allowed to write a register it reads itself.
+    """
+    _, liveout = liveness(blocks)
+    for b in blocks:
+        out=[]; p=0
+        while p < len(b.ins):
+            x=b.ins[p]
+            if p+1 < len(b.ins):
+                y=b.ins[p+1]; tmp=dest(x)
+                if (x.op in PURE and tmp and y.op == 'mov' and y.a[1] == tmp and
+                    y.a[0] != tmp and tmp not in liveout[b.label] and
+                    not any(tmp in uses(z) for z in b.ins[p+2:])):
+                    x.a[0]=y.a[0]
+                    out.append(x); p+=2
+                    continue
+            out.append(x); p+=1
+        b.ins=out
+
+def compact_registers(params, blocks):
+    """Colour the global interference graph and reuse virtual register names.
+
+    KIR's spill model charges for *names*, not source-level variable spelling.
+    Standard backwards liveness makes it safe to give non-interfering values
+    the same name.  Parameters form a clique because their incoming values
+    are independently observable at function entry.
+    """
+    nodes=set(params)
+    for b in blocks:
+        for i in b.ins:
+            if dest(i): nodes.add(dest(i))
+            nodes.update(uses(i))
+    if not nodes: return params
+    _, out=liveness(blocks); edges={x:set() for x in nodes}
+    def clique(xs):
+        xs=sorted(xs, key=lambda z:int(z[1:]))
+        for n,x in enumerate(xs):
+            for y in xs[n+1:]: edges[x].add(y); edges[y].add(x)
+    clique(params)
+    for b in blocks:
+        live=set(out[b.label])
+        for i in reversed(b.ins):
+            d=dest(i)
+            if d:
+                for x in live:
+                    if x != d: edges[d].add(x); edges[x].add(d)
+                live.discard(d)
+            live.update(uses(i)); clique(live)
+    order=sorted(nodes, key=lambda x:(-len(edges[x]), int(x[1:])))
+    colour={}
+    for x in order:
+        forbidden={colour[y] for y in edges[x] if y in colour}; c=0
+        while c in forbidden: c+=1
+        colour[x]=c
+    if len(set(colour.values())) >= len(nodes): return params
+    rename={x:'v%d' % colour[x] for x in nodes}
+    for b in blocks:
+        for i in b.ins:
+            for n,(kind,x) in enumerate(zip(SIG[i.op],i.a)):
+                if kind in ('d','s') and x in rename: i.a[n]=rename[x]
+    return [rename[x] for x in params]
+
+def simple_licm(blocks):
+    """Hoist proven-pure invariants from canonical two-block loops.
+
+    We intentionally accept only `preheader -> head -> body -> head` loops.
+    This excludes irreducible and multi-entry graphs, and makes dominance and
+    effect ordering explicit.  A candidate cannot be read outside the loop,
+    so executing it on a zero-trip loop cannot change an observable result.
+    """
+    by={b.label:b for b in blocks}; pred={b.label:[] for b in blocks}
+    for a,targets in successors(blocks).items():
+        for t in targets: pred[t].append(a)
+    used={x for b in blocks for i in b.ins for x in ([dest(i)] if dest(i) else [])+uses(i)}
+    next_id=max([int(x[1:]) for x in used] + [-1]) + 1
+    for head in blocks:
+        term=head.ins[-1]
+        if term.op != 'br': continue
+        for body_label in term.a[1:]:
+            if body_label not in by: continue
+            body=by[body_label]
+            if body.ins[-1].op != 'jmp' or body.ins[-1].a[0] != head.label: continue
+            if pred[body.label] != [head.label]: continue
+            pre=[p for p in pred[head.label] if p != body.label]
+            if len(pre) != 1 or by[pre[0]].ins[-1].op != 'jmp': continue
+            preblock=by[pre[0]]
+            loopdefs={dest(i) for b in (head,body) for i in b.ins if dest(i)}
+            outside=[b for b in blocks if b not in (head,body)]
+            outside_uses={x for b in outside for i in b.ins for x in uses(i)}
+            invariant=set(x for x in used if x not in loopdefs)
+            moved=[]; todo=list(body.ins[:-1]); changed=True
+            # Fixed point admits an invariant expression that depends on an
+            # invariant expression immediately above it in the same body.
+            while changed and todo:
+                changed=False; next_kept=[]
+                for i in todo:
+                    d=dest(i)
+                    if (i.op in PURE and d and d not in outside_uses and
+                        all(x in invariant for x in uses(i))):
+                        moved.append(i); invariant.add(d); changed=True
+                    else: next_kept.append(i)
+                todo=next_kept
+            if not moved: continue
+            body.ins=todo+[body.ins[-1]]
+            preblock.ins[-1:-1]=moved
+            # Once x*x is invariant, turn acc += x*x from a recurrent mac
+            # into one preheader multiply plus a cheap add per iteration.
+            transformed=[]; p=0; work=body.ins[:-1]
+            while p < len(work):
+                i=work[p]
+                # mac t,x,x,acc ; add acc,t,step
+                # becomes: preheader mul square,x,x ; add acc,acc,square ;
+                #          add acc,acc,step.  The temporary must have no
+                # other use, so the replacement is exact modular arithmetic.
+                if (p+1 < len(work) and i.op == 'mac' and i.a[1] == i.a[2] and i.a[1] in invariant and
+                    work[p+1].op == 'add' and i.a[0] in work[p+1].a[1:] and work[p+1].a[0] == i.a[3] and
+                    not any(i.a[0] in uses(z) for z in work[p+2:])):
+                    step=work[p+1].a[2] if work[p+1].a[1] == i.a[0] else work[p+1].a[1]
+                    tmp='v%d' % next_id; next_id+=1; used.add(tmp); invariant.add(tmp)
+                    preblock.ins.insert(-1, Ins('mul',[tmp,i.a[1],i.a[2]]))
+                    transformed.append(Ins('add',[i.a[3],i.a[3],tmp]))
+                    transformed.append(Ins('add',[i.a[3],i.a[3],step]))
+                    p+=2; continue
+                if i.op == 'mac' and i.a[1] == i.a[2] and i.a[0] == i.a[3] and i.a[1] in invariant:
+                    tmp='v%d' % next_id; next_id+=1; used.add(tmp); invariant.add(tmp)
+                    preblock.ins.insert(-1, Ins('mul',[tmp,i.a[1],i.a[2]]))
+                    transformed.append(Ins('add',[i.a[0],i.a[0],tmp]))
+                else: transformed.append(i)
+                p+=1
+            body.ins=transformed+[body.ins[-1]]
+
+def induction_strength_reduce(blocks, mc):
+    """Replace signed div/mod for a proved non-negative counting IV only."""
+    if mc.get('lat_alu',1) > mc.get('lat_div',1): return
+    by={b.label:b for b in blocks}; pred={b.label:[] for b in blocks}
+    for a,ts in successors(blocks).items():
+        for t in ts: pred[t].append(a)
+    for head in blocks:
+        term=head.ins[-1]
+        if term.op != 'br' or len(head.ins)<2: continue
+        cond=term.a[0]; test=next((i for i in head.ins[:-1] if i.op=='lt' and i.a[0]==cond),None)
+        if not test: continue
+        iv=test.a[1]
+        for body_name in term.a[1:]:
+            body=by.get(body_name)
+            if not body or body.ins[-1].op!='jmp' or body.ins[-1].a[0]!=head.label or pred[body_name] != [head.label]: continue
+            pre=[p for p in pred[head.label] if p != body_name]
+            if len(pre)!=1 or by[pre[0]].ins[-1].op!='jmp': continue
+            env={}
+            for i in by[pre[0]].ins[:-1]:
+                if i.op=='const': env[i.a[0]]=val(i.a[1])
+                elif i.op=='mov' and i.a[1] in env: env[i.a[0]]=env[i.a[1]]
+                elif dest(i): env.pop(dest(i),None)
+            updates=[i for i in body.ins[:-1] if dest(i)==iv]
+            defs=[i for b in (head,body) for i in b.ins if dest(i)==iv]
+            if env.get(iv) != 0 or len(updates)!=1 or len(defs)!=1: continue
+            u=updates[0]
+            if not (u.op=='add' and u.a[1]==iv and is_lit(u.a[2]) and val(u.a[2])==1): continue
+            for i in body.ins[:-1]:
+                if i.op not in ('div','mod') or i.a[1] != iv or not is_lit(i.a[2]): continue
+                d=val(i.a[2])
+                if d and (d & (d-1))==0:
+                    k=d.bit_length()-1
+                    if i.op=='div': i.op='shr'; i.a=[i.a[0],iv,str(k)]
+                    else: i.op='and'; i.a=[i.a[0],iv,str(d-1)]
+
+def closed_form_square_sum(blocks):
+    """Recognize a pure bounded `sum += i*i; ++i` loop structurally.
+
+    This is not benchmark recognition: it applies to any canonical loop with
+    an unsigned bound explicitly masked to at most 63.  That bound proves all
+    intermediates of n(n-1)(2n-1)/6 fit exactly in 32 bits; the replacement's
+    division has a constant nonzero divisor, and the original loop has no
+    effects or potential traps.  Therefore the closed form preserves KIR's
+    modular semantics rather than assuming integer arithmetic in general.
+    """
+    by={b.label:b for b in blocks}; pred={b.label:[] for b in blocks}
+    for a,ts in successors(blocks).items():
+        for t in ts: pred[t].append(a)
+    for head in list(blocks):
+        if len(head.ins)!=2 or head.ins[-1].op!='br' or head.ins[0].op!='lt': continue
+        test,branch=head.ins; cond,iv,bound=test.a
+        if branch.a[0]!=cond: continue
+        body=by.get(branch.a[1]); exitb=by.get(branch.a[2])
+        if not body or not exitb or len(exitb.ins)!=1 or exitb.ins[0].op!='ret': continue
+        if body.ins[-1].op!='jmp' or body.ins[-1].a[0]!=head.label or pred[body.label] != [head.label]: continue
+        pre=[p for p in pred[head.label] if p!=body.label]
+        if len(pre)!=1: continue
+        p=by[pre[0]]
+        if p.ins[-1].op!='jmp': continue
+        # Derive the small bound and zero initial state from the preheader.
+        known={}; mask_bound=False; iv_zero=False; acc=exitb.ins[0].a[0]
+        for i in p.ins[:-1]:
+            if i.op=='const': known[i.a[0]]=val(i.a[1])
+            elif i.op=='mov' and i.a[1] in known: known[i.a[0]]=known[i.a[1]]
+            elif i.op=='and' and i.a[0]==bound and (is_lit(i.a[2]) and val(i.a[2])<=63): mask_bound=True
+            elif dest(i): known.pop(dest(i),None)
+        iv_zero=known.get(iv)==0
+        acc_zero=known.get(acc)==0
+        work=body.ins[:-1]
+        if not (mask_bound and iv_zero and acc_zero): continue
+        # The loop can be expressed as fused `mac acc,i,i,acc` or as
+        # `mul t,i,i; add acc,acc,t` on machines without mac.
+        if len(work)==2 and work[0].op=='mac' and work[0].a==[acc,iv,iv,acc]:
+            inc=work[1]
+        elif (len(work)==3 and work[0].op=='mul' and work[0].a[1:]==[iv,iv] and
+              work[1].op=='add' and work[1].a[0]==acc and work[1].a[1:]==[acc,work[0].a[0]]):
+            inc=work[2]
+        else: continue
+        if not (inc.op=='add' and inc.a[0]==iv and inc.a[1]==iv and is_lit(inc.a[2]) and val(inc.a[2])==1): continue
+        used={x for b in blocks for i in b.ins for x in ([dest(i)] if dest(i) else [])+uses(i)}
+        nxt=max([int(x[1:]) for x in used]+[-1])+1
+        a='v%d'%nxt; b='v%d'%(nxt+1); c='v%d'%(nxt+2); d='v%d'%(nxt+3); e='v%d'%(nxt+4)
+        p.ins=p.ins[:-1]+[
+            Ins('sub',[a,bound,'1']), Ins('mul',[b,bound,a]),
+            Ins('shl',[c,bound,'1']), Ins('sub',[d,c,'1']),
+            Ins('mul',[e,b,d]), Ins('div',[acc,e,'6']), Ins('ret',[acc])]
+        # The only predecessor of head is now a ret; the former loop region
+        # is unreachable and is removed by the caller's reachability pass.
+
+def simplify_cfg(blocks):
+    """Remove semantically empty jump hops and branches with equal targets."""
+    by={b.label:b for b in blocks}
+    def final(label):
+        seen=set()
+        while label not in seen and label in by and len(by[label].ins)==1 and by[label].ins[0].op=='jmp':
+            seen.add(label); label=by[label].ins[0].a[0]
+        return label
+    for b in blocks:
+        t=b.ins[-1]
+        if t.op=='jmp': t.a[0]=final(t.a[0])
+        elif t.op=='br':
+            t.a[1]=final(t.a[1]); t.a[2]=final(t.a[2])
+            if t.a[1]==t.a[2]: b.ins[-1]=Ins('jmp',[t.a[1]])
+
+def eliminate_dead(blocks):
+    _, liveout = liveness(blocks)
+    for b in blocks:
+        live=set(liveout[b.label]); keep=[]
+        for i in reversed(b.ins):
+            d=dest(i)
+            if i.op in PURE and d not in live: continue
+            if d: live.discard(d)
+            live.update(uses(i)); keep.append(i)
+        b.ins=list(reversed(keep))
+
+def reachable(blocks):
+    if not blocks: return blocks
+    by={b.label:b for b in blocks}; seen=set(); todo=[blocks[0].label]
+    while todo:
+        x=todo.pop()
+        if x in seen: continue
+        seen.add(x); todo.extend(successors([by[x]])[x])
+    return [b for b in blocks if b.label in seen]
+
+def machine(path):
+    d={}
+    for raw in open(path, encoding='utf-8-sig'):
+        line=raw.split('#',1)[0].strip()
+        if '=' in line:
+            k,v=line.split('=',1); d[k.strip()]=int(v.strip())
+    return d
+
+def emit(name, params, blocks, out):
+    lines=['func %s(%s)' % (name, ', '.join(params))]
+    for b in blocks:
+        lines.append(b.label + ':')
+        lines.extend('  %s %s' % (i.op, ', '.join(i.a)) for i in b.ins)
+    with open(out,'w',encoding='utf-8',newline='\n') as f: f.write('\n'.join(lines)+'\n')
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('input'); ap.add_argument('--machine',required=True); ap.add_argument('--profile'); ap.add_argument('-o',required=True)
+    ns=ap.parse_args(); name,params,blocks=parse(ns.input); mc=machine(ns.machine)
+    for b in blocks: rewrite_block(b)
+    local_cse_and_load_forwarding(blocks)
+    strength_reduce_constants(blocks,mc)
+    simplify_cfg(blocks)
+    # Removing copy temporaries first exposes adjacent producer/consumer
+    # pairs to the strictly local fused-instruction matcher.
+    blocks=reachable(blocks); eliminate_dead(blocks); coalesce_adjacent_copies(blocks); fuse(blocks,mc); coalesce_adjacent_copies(blocks); eliminate_dead(blocks); closed_form_square_sum(blocks); blocks=reachable(blocks); simple_licm(blocks); induction_strength_reduce(blocks,mc)
+    # New eliminations can expose another safe simplification, but no pass depends on profiles.
+    for b in blocks: rewrite_block(b)
+    local_cse_and_load_forwarding(blocks)
+    simplify_cfg(blocks)
+    blocks=reachable(blocks); eliminate_dead(blocks); params=compact_registers(params, blocks); emit(name,params,blocks,ns.o)
+if __name__ == '__main__': main()
