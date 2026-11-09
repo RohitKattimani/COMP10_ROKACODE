@@ -25,3 +25,13 @@ python3 tests/benchmark.py --kit KIT --out benchmark-full --random 100
 ```
 
 The script writes a CSV containing every combination and a Markdown summary. It exits nonzero if any optimizer, validator, simulator, or timeout case fails.
+
+It enforces the contest's five-second optimizer limit for ordinary benchmark
+programs. For large-scale limits, run:
+
+```sh
+python3 tests/stress.py --machine KIT/machines/machine_default.cfg
+```
+
+This checks both a 100,000-instruction program against the 30-second limit and
+a 1,000-simultaneously-live-register program against the five-second limit.

@@ -14,9 +14,11 @@ plus the sample input.
 | Optimized total cycles | 163,112 |
 | Total cycle reduction | 71.92% |
 | Geometric-mean speedup | 2.531x |
-| Full-matrix wall time | 966.7 seconds |
+| Full-matrix wall time | 1,087.2 seconds |
 
-The matrix used the final, stable optimizer revision. The bounded-square-sum
+The matrix used the repaired, stable optimizer revision, with a five-second
+optimizer timeout enforced separately for every normal program. The
+bounded-square-sum
 closed-form output was additionally validated on all five machines with 1,001
 inputs each.
 

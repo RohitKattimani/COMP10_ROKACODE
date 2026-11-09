@@ -120,7 +120,11 @@ def rewrite_block(b):
                 else: allconst=False; break
         foldable = i.op in PURE or (i.op in ('div','mod') and allconst and values[1] != 0)
         if d and allconst and foldable:
-            i.op='const'; i.a=[d,fmt(evalop(i.op if i.op not in ('const','mov') else 'mov', values))] if False else [d,fmt(evalop({'const':'mov'}.get(i.op,i.op),values))]
+            # Evaluate before changing the opcode.  Folding `add 5, 7` as a
+            # `mov` would silently return 5 rather than 12.
+            original_op = i.op
+            result = evalop('mov' if original_op == 'const' else original_op, values)
+            i.op='const'; i.a=[d,fmt(result)]
         elif d:
             # Identities valid for modular arithmetic, all without effects.
             a=i.a
@@ -133,7 +137,8 @@ def rewrite_block(b):
             elif i.op == 'mul' and is_lit(a[1]) and val(a[1]) == 1: i.op='mov'; i.a=[d,a[2]]
             elif i.op == 'and' and ((is_lit(a[1]) and val(a[1]) == 0) or (is_lit(a[2]) and val(a[2]) == 0)): i.op='const'; i.a=[d,'0']
             elif i.op in ('shl','shr') and is_lit(a[2]) and (val(a[2])&31)==0: i.op='mov'; i.a=[d,a[1]]
-            elif i.op in ('eq','lt') and a[1] == a[2]: i.op='const'; i.a=[d, '1' if i.op=='eq' else '0']
+            elif i.op in ('eq','lt') and a[1] == a[2]:
+                same_op=i.op; i.op='const'; i.a=[d, '1' if same_op=='eq' else '0']
             elif i.op == 'select' and a[2] == a[3]: i.op='mov'; i.a=[d,a[2]]
             elif i.op == 'div' and is_lit(a[2]) and val(a[2]) == 1: i.op='mov'; i.a=[d,a[1]]
             elif i.op == 'mod' and is_lit(a[2]) and val(a[2]) in (1,MASK): i.op='const'; i.a=[d,'0']
@@ -284,7 +289,10 @@ def compact_registers(params, blocks):
                 for x in live:
                     if x != d: edges[d].add(x); edges[x].add(d)
                 live.discard(d)
-            live.update(uses(i)); clique(live)
+            # Standard def-vs-live interference construction.  Adding a
+            # clique for every live set is both redundant and quadratic in
+            # the live-set size at every instruction.
+            live.update(uses(i))
     order=sorted(nodes, key=lambda x:(-len(edges[x]), int(x[1:])))
     colour={}
     for x in order:
@@ -352,9 +360,12 @@ def simple_licm(blocks):
                 #          add acc,acc,step.  The temporary must have no
                 # other use, so the replacement is exact modular arithmetic.
                 if (p+1 < len(work) and i.op == 'mac' and i.a[1] == i.a[2] and i.a[1] in invariant and
-                    work[p+1].op == 'add' and i.a[0] in work[p+1].a[1:] and work[p+1].a[0] == i.a[3] and
+                    i.a[0] != i.a[3] and work[p+1].op == 'add' and
+                    work[p+1].a[1:].count(i.a[0]) == 1 and work[p+1].a[0] == i.a[3] and
                     not any(i.a[0] in uses(z) for z in work[p+2:])):
                     step=work[p+1].a[2] if work[p+1].a[1] == i.a[0] else work[p+1].a[1]
+                    if step == i.a[0] or step == i.a[3]:
+                        transformed.append(i); p+=1; continue
                     tmp='v%d' % next_id; next_id+=1; used.add(tmp); invariant.add(tmp)
                     preblock.ins.insert(-1, Ins('mul',[tmp,i.a[1],i.a[2]]))
                     transformed.append(Ins('add',[i.a[3],i.a[3],tmp]))
@@ -427,22 +438,34 @@ def closed_form_square_sum(blocks):
         if len(pre)!=1: continue
         p=by[pre[0]]
         if p.ins[-1].op!='jmp': continue
-        # Derive the small bound and zero initial state from the preheader.
-        known={}; mask_bound=False; iv_zero=False; acc=exitb.ins[0].a[0]
+        # Derive final preheader facts.  Every definition invalidates prior
+        # facts, including an earlier `and bound, ..., 63`.
+        known={}; upper={}; iv_zero=False; acc=exitb.ins[0].a[0]
         for i in p.ins[:-1]:
-            if i.op=='const': known[i.a[0]]=val(i.a[1])
-            elif i.op=='mov' and i.a[1] in known: known[i.a[0]]=known[i.a[1]]
-            elif i.op=='and' and i.a[0]==bound and (is_lit(i.a[2]) and val(i.a[2])<=63): mask_bound=True
-            elif dest(i): known.pop(dest(i),None)
+            d=dest(i)
+            if d and not (i.op=='mov' and i.a[1] == d):
+                known.pop(d,None); upper.pop(d,None)
+            if i.op=='const':
+                known[i.a[0]]=val(i.a[1]); upper[i.a[0]]=val(i.a[1])
+            elif i.op=='mov':
+                if i.a[1] in known: known[i.a[0]]=known[i.a[1]]
+                if i.a[1] in upper: upper[i.a[0]]=upper[i.a[1]]
+            elif i.op=='and':
+                limits=[]
+                for x in i.a[1:]:
+                    if is_lit(x): limits.append(val(x))
+                    elif x in upper: limits.append(upper[x])
+                if limits: upper[i.a[0]]=min(limits)
         iv_zero=known.get(iv)==0
         acc_zero=known.get(acc)==0
         work=body.ins[:-1]
-        if not (mask_bound and iv_zero and acc_zero): continue
+        if not (upper.get(bound, MASK+1) <= 63 and iv_zero and acc_zero): continue
+        if len({acc, iv, bound}) != 3: continue
         # The loop can be expressed as fused `mac acc,i,i,acc` or as
         # `mul t,i,i; add acc,acc,t` on machines without mac.
         if len(work)==2 and work[0].op=='mac' and work[0].a==[acc,iv,iv,acc]:
             inc=work[1]
-        elif (len(work)==3 and work[0].op=='mul' and work[0].a[1:]==[iv,iv] and
+        elif (len(work)==3 and work[0].op=='mul' and work[0].a[0] not in (acc,iv,bound) and work[0].a[1:]==[iv,iv] and
               work[1].op=='add' and work[1].a[0]==acc and work[1].a[1:]==[acc,work[0].a[0]]):
             inc=work[2]
         else: continue
