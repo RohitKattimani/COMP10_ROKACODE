@@ -7,12 +7,12 @@
 ./kopt input.kir --machine machine.cfg [--profile profile.prof] -o output.kir
 ```
 
-No installation is required. The optional profile is accepted for command-line compatibility; this correctness-first implementation does not rely on it.
+No installation is required. The optional profile is accepted for command-line compatibility, this correctness-first implementation does not rely on it.
 
 ## Headline result
 
 On the supplied public machine, the optimized `sum_sq` benchmark runs in **21
-cycles**—versus **207 cycles** for the supplied reference implementation and
+cycles** versus **207 cycles** for the supplied reference implementation and
 **2,690 cycles** for the original program. The 21-cycle output passes official
 randomized equivalence validation (including the benchmark input).
 
