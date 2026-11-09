@@ -169,6 +169,31 @@ done:
             run([sys.executable,str(kopt),str(src),'--machine',str(default),'-o',str(out)])
             run([sys.executable,str(kit/'kvalidate'),str(out),'--against',str(src),'--machine',str(default),'--random','500'])
             validated += 1
+        # Regression: the old LICM hoisted the const below this vstore and
+        # changed the first volatile log entry.  The const must remain in the
+        # body because v4 is read before it is defined in each iteration.
+        first_read='''func licm_first_iteration(v0, v4)
+pre:
+  and v0, v0, 3
+  const v1, 0
+  jmp head
+head:
+  lt v2, v1, v0
+  br v2, body, done
+body:
+  vstore 1, v4
+  const v4, -1
+  add v1, v1, 1
+  jmp head
+done:
+  ret v1
+'''
+        src=d/'licm_first_iteration.kir'; out=d/'licm_first_iteration.out.kir'; src.write_text(first_read,encoding='utf-8')
+        run([sys.executable,str(kopt),str(src),'--machine',str(default),'-o',str(out)])
+        run([sys.executable,str(kit/'kvalidate'),str(out),'--against',str(src),'--machine',str(default),'--random','1000'])
+        if 'const v4, 4294967295' not in out.read_text(encoding='utf-8').split('body:',1)[1]:
+            raise RuntimeError('LICM first-iteration regression was hoisted')
+        validated += 1
         # Unseen machines exercise disabled fusion individually and together.
         for name, changes in [('no_mac',{'fused_addsh':1}), ('no_addsh',{'fused_mac':1}), ('none',{})]:
             print('machine:', name, flush=True)

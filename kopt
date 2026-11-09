@@ -335,6 +335,19 @@ def simple_licm(blocks):
             outside=[b for b in blocks if b not in (head,body)]
             outside_uses={x for b in outside for i in b.ins for x in uses(i)}
             invariant=set(x for x in used if x not in loopdefs)
+            # A hoisted definition must not change a value observed before
+            # that definition in the first loop iteration.  Require a unique
+            # loop definition and no earlier read in the head/body ordering.
+            defcount={}
+            for lb in (head,body):
+                for ins in lb.ins:
+                    d0=dest(ins)
+                    if d0: defcount[d0]=defcount.get(d0,0)+1
+            head_reads={x for ins in head.ins for x in uses(ins)}
+            reads_before={}; seen=set()
+            for ins in body.ins[:-1]:
+                reads_before[id(ins)]=set(seen)
+                seen.update(uses(ins))
             moved=[]; todo=list(body.ins[:-1]); changed=True
             # Fixed point admits an invariant expression that depends on an
             # invariant expression immediately above it in the same body.
@@ -343,6 +356,8 @@ def simple_licm(blocks):
                 for i in todo:
                     d=dest(i)
                     if (i.op in PURE and d and d not in outside_uses and
+                        defcount.get(d,0)==1 and d not in head_reads and
+                        d not in reads_before[id(i)] and
                         all(x in invariant for x in uses(i))):
                         moved.append(i); invariant.add(d); changed=True
                     else: next_kept.append(i)

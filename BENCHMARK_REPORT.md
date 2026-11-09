@@ -14,7 +14,10 @@ plus the sample input.
 | Optimized total cycles | 163,112 |
 | Total cycle reduction | 71.92% |
 | Geometric-mean speedup | 2.531x |
-| Full-matrix wall time | 1,087.2 seconds |
+| Full-matrix wall time | 1,104.8 seconds |
+
+The repaired revision enforced a five-second optimizer timeout per normal
+program; the slowest optimizer invocation was 1.25 seconds.
 
 The matrix used the repaired, stable optimizer revision, with a five-second
 optimizer timeout enforced separately for every normal program. The

@@ -13,7 +13,9 @@ def run(cmd, timeout):
         p=subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
         return p.returncode, p.stdout
     except subprocess.TimeoutExpired as e:
-        return 124, (e.stdout or '') + '\nTIMEOUT'
+        output=e.stdout or ''
+        if isinstance(output, bytes): output=output.decode('utf-8','replace')
+        return 124, output + '\nTIMEOUT'
 
 def cycles(text):
     m=re.search(r'^cycles:\s*(\d+)', text, re.M)
